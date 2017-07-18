@@ -187,18 +187,18 @@ class SASLClient(object):
         Choose a mechanism from a list of mechanisms based on security
         scores for mechanisms and required properties of the mechanism.
 
-        If `allow_anonymous` is ``False``, mechanisms that allow anonymous
+        if `allow_anonymous` is ``False``, mechanisms that allow anonymous
         authentication will not be considered.
 
-        If `allow_plaintext` is ``False``, mechanisms that transmit
+        if `allow_plaintext` is ``False``, mechanisms that transmit
         sensitive information in plaintext (and are thus susceptible to
         passive listening attacks) will not be considered.
 
-        If `allow_active` is ``False``, mechanisms that are susceptible
-        to active non-dictionary attacks (MITM, injection) will not be
+        if `allow_active` is ``False``, mechanisms that are susceptible
+        to active non-dictionary attacks (mitm, injection) will not be
         considered.
 
-        If `allow_dictionary` is ``False, mechanisms that are susceptible
+        if `allow_dictionary` is ``False``, mechanisms that are susceptible
         to passive dictionary attacks will not be considered.
         """
         candidates = [mech_mod.mechanisms[choice]

@@ -4,6 +4,7 @@ import hmac
 import random
 import struct
 import sys
+import os
 
 from puresasl import SASLError, SASLProtocolException, QOP
 
@@ -34,11 +35,6 @@ class Mechanism(object):
     """ A relative security score where higher scores correspond
     to more secure mechanisms. """
 
-    complete = False
-    """ Set to True when SASL negotiation has completed succesfully. """
-
-    has_initial_response = False
-
     allows_anonymous = True
     """ True if the mechanism allows for anonymous logins. """
 
@@ -51,14 +47,20 @@ class Mechanism(object):
     dictionary_safe = False
     """ True if the mechanism is safe against passive dictionary attacks. """
 
-    qops = [QOP.AUTH]
-    """ QOPs supported by the Mechanism """
-
-    qop = QOP.AUTH
-    """ Selected QOP """
 
     def __init__(self, sasl, **props):
+        self.qops = [QOP.AUTH]      # QOPs supported by the Mechanism
+        self.qop = QOP.AUTH         # Selected QOP
+        self.complete = False       # Set to True when SASL negotiation has
+                                    # completed succesfully.
         self.sasl = sasl
+
+        # Set properties that are passed in
+        for key, value in props.iteritems():
+            super(Mechanism, self).__setattr__(key, value)
+
+    def __setattr__(self, key, value):
+        super(Mechanism, self).__setattr__(key, value)
 
     def process(self, challenge=None):
         """
@@ -133,8 +135,10 @@ class AnonymousMechanism(Mechanism):
     """
     name = 'ANONYMOUS'
     score = 0
-
     uses_plaintext = False
+
+    def __init__(self, sasl, **props):
+        super(AnonymousMechanism, self).__init__(sasl, **props)
 
     def process(self, challenge=None):
         self.complete = True
@@ -147,20 +151,21 @@ class PlainMechanism(Mechanism):
     """
     name = 'PLAIN'
     score = 1
-
     allows_anonymous = False
+
+
+    def __init__(self, sasl, username=None, password=None, identity='', **props):
+        super(PlainMechanism, self).__init__(sasl, **props)
+
+        self.identity = identity
+        self.username = username
+        self.password = password
 
     def wrap(self, outgoing):
         return outgoing
 
     def unwrap(self, incoming):
         return incoming
-
-    def __init__(self, sasl, username=None, password=None, identity='', **props):
-        Mechanism.__init__(self, sasl)
-        self.identity = identity
-        self.username = username
-        self.password = password
 
     def process(self, challenge=None):
         self._fetch_properties('username', 'password')
@@ -180,7 +185,8 @@ class CramMD5Mechanism(PlainMechanism):
     uses_plaintext = False
 
     def __init__(self, sasl, username=None, password=None, **props):
-        Mechanism.__init__(self, sasl)
+        super(CramMD5Mechanism, self).__init__(sasl, **props)
+
         self.username = username
         self.password = password
 
@@ -236,17 +242,23 @@ def quote(text):
 
 
 class DigestMD5Mechanism(Mechanism):
-
     name = "DIGEST-MD5"
     score = 30
-
     allows_anonymous = False
     uses_plaintext = False
 
+
     def __init__(self, sasl, username=None, password=None, **props):
-        Mechanism.__init__(self, sasl)
+        # Variables that can be overridden as properties
+        self.nonce = "dummy"
+        self.cnonce = "dummy"
+        self.nc = 0
+        self.charset = "utf-8"
+        self.authzid = None
+        super(DigestMD5Mechanism, self).__init__(sasl, **props)
         self.username = username
         self.password = password
+        self.max_buffer = 65536
 
         self._rspauth_okay = False
         self._digest_uri = None
@@ -258,7 +270,6 @@ class DigestMD5Mechanism(Mechanism):
         self._a1 = None
 
         self.password = None
-        self.key_hash = None
         self.realm = None
         self.nonce = None
         self.cnonce = None
@@ -271,34 +282,37 @@ class DigestMD5Mechanism(Mechanism):
         return incoming
 
     def response(self):
-        required_props = ['username']
-        if not getattr(self, 'key_hash', None):
-            required_props.append('password')
+        required_props = ['username', 'password']
         self._fetch_properties(*required_props)
 
-        resp = {}
-        resp['qop'] = self.qop
+        if self.nc == 0:
+            self.cnonce = bytes(base64.b64encode(os.urandom(30)))
 
+        resp = {}
+        resp['charset'] = self.charset
+        resp['username'] = quote(bytes(self.username))
         if getattr(self, 'realm', None) is not None:
             resp['realm'] = quote(self.realm)
-
-        resp['username'] = quote(bytes(self.username))
         resp['nonce'] = quote(self.nonce)
-        if self.nc == 0:
-            self.cnonce = bytes('%s' % random.random())[2:]
-        resp['cnonce'] = quote(self.cnonce)
         self.nc += 1
         resp['nc'] = bytes('%08x' % self.nc)
+        resp['cnonce'] = quote(self.cnonce)
 
         self._digest_uri = (
-            bytes(self.sasl.service) + b'/' + bytes(self.sasl.host))
+            bytes(self.sasl.service) + b'/' + bytes(self.realm))
         resp['digest-uri'] = quote(self._digest_uri)
+        resp['maxbuf'] = bytes(str(self.max_buffer))
 
         a2 = b'AUTHENTICATE:' + self._digest_uri
         if self.qop != b'auth':
             a2 += b':00000000000000000000000000000000'
-            resp['maxbuf'] = b'16777215'  # 2**24-1
         resp['response'] = self.gen_hash(a2)
+
+        resp['qop'] = self.qop
+        if self.authzid:
+            resp['authzid'] = quote(bytes(self.authzid))
+
+
         return b','.join([bytes(k) + b'=' + bytes(v) for k, v in resp.items()])
 
     @staticmethod
@@ -351,28 +365,27 @@ class DigestMD5Mechanism(Mechanism):
         return ret
 
     def gen_hash(self, a2):
-        if not getattr(self, 'key_hash', None):
-            key_hash = hashlib.md5()
-            user = bytes(self.username)
-            password = bytes(self.password)
-            realm = bytes(self.realm)
-            kh = user + b':' + realm + b':' + password
-            key_hash.update(kh)
-            self.key_hash = key_hash.digest()
+        user = bytes(self.username)
+        password = bytes(self.password)
+        realm = bytes(self.realm)
 
-        a1 = hashlib.md5(self.key_hash)
-        a1h = b':' + self.nonce + b':' + self.cnonce
-        a1.update(a1h)
-        response = hashlib.md5()
-        self._a1 = a1.digest()
-        rv = bytes(a1.hexdigest().lower())
-        rv += b':' + self.nonce
-        rv += b':' + bytes('%08x' % self.nc)
-        rv += b':' + self.cnonce
-        rv += b':' + self.qop
-        rv += b':' + bytes(hashlib.md5(a2).hexdigest().lower())
-        response.update(rv)
-        return bytes(response.hexdigest().lower())
+        a1p1 = hashlib.md5(user + b":" + realm + b":" + password).digest()
+        if self.authzid:
+            a1p2 = b':' + self.nonce + b':' + self.cnonce + b':' + self.authzid
+        else:
+            a1p2 = b':' + self.nonce + b':' + self.cnonce
+
+        a1 = a1p1 + a1p2
+
+        kdp1 = hashlib.md5(a1).hexdigest()
+        kdp2 = self.nonce + \
+                b':' + bytes('%08x' % self.nc) + \
+                b':' + self.cnonce  + \
+                b':' + self.qop + \
+                b':' + hashlib.md5(a2).hexdigest()
+
+        response = hashlib.md5(kdp1 + b':' + kdp2).hexdigest()
+        return bytes(response)
 
     # untested
     def authenticate_server(self, cmp_hash):
@@ -380,20 +393,17 @@ class DigestMD5Mechanism(Mechanism):
         if self.qop != b'auth':
             a2 += b':00000000000000000000000000000000'
         if self.gen_hash(a2) == cmp_hash:
-            self._rspauth_okay = True
+            self.complete = True
+        else:
+            raise SASLError("Authentication failed")
 
-    def process(self, challenge=None):
-        if challenge is None:
-            needed = ['username', 'realm', 'nonce', 'key_hash',
-                      'nc', 'cnonce', 'qops']
-            if all(getattr(self, p, None) is not None for p in needed):
-                return self.response()
-            else:
-                return None
-
-        challenge_dict = DigestMD5Mechanism.parse_challenge(challenge)
-        if self.sasl.mutual_auth and 'rspauth' in challenge_dict:
+    def process(self, challenge):
+        challenge_dict = self.parse_challenge(challenge)
+        if 'rspauth' in challenge_dict:
             self.authenticate_server(challenge_dict['rspauth'])
+        if self.complete:
+            return None
+
 
         if 'realm' not in challenge_dict:
             self._fetch_properties('realm')
@@ -413,7 +423,6 @@ class DigestMD5Mechanism(Mechanism):
         if 'maxbuf' in challenge_dict:
             self.max_buffer = min(
                 self.sasl.max_buffer, int(challenge_dict['maxbuf']))
-
         return self.response()
 
 
@@ -427,7 +436,7 @@ class GSSAPIMechanism(Mechanism):
     active_safe = True
 
     def __init__(self, sasl, principal=None, **props):
-        Mechanism.__init__(self, sasl)
+        super(GSSAPIMechanism, self).__init__(sasl, **props)
         self.user = None
         self._have_negotiated_details = False
         self.host = self.sasl.host
